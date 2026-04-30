@@ -188,6 +188,7 @@ def fetch_hackernews_ai(hours: int = LOOKBACK_HOURS) -> list[dict]:
                 "image_url": None,  # HN은 og:image 폴백으로 보충됨
                 "published": h.get("created_at", datetime.now(timezone.utc).isoformat()),
             })
+        print(f"[INFO] Hacker News: {len(articles)}개 수집")
         return articles
     except Exception as e:
         print(f"[WARN] Hacker News API 실패: {e}")
@@ -227,6 +228,7 @@ def fetch_arxiv_ai() -> list[dict]:
                 "image_url": None,  # arXiv는 이미지 없음, 플레이스홀더로 처리
                 "published": pub_dt.isoformat(),
             })
+        print(f"[INFO] arXiv: {len(articles)}개 수집")
         return articles
     except Exception as e:
         print(f"[WARN] arXiv API 실패: {e}")
@@ -270,6 +272,7 @@ def fetch_github_trending_ai() -> list[dict]:
                 "published": it.get("pushed_at", datetime.now(timezone.utc).isoformat()),
                 "_repo_url": it.get("html_url", ""),  # og:image 보충용
             })
+        print(f"[INFO] GitHub: {len(articles)}개 수집")
         return articles
     except Exception as e:
         print(f"[WARN] GitHub API 실패: {e}")
@@ -316,11 +319,13 @@ def curate_with_claude(articles: list[dict]) -> dict:
 
     today_kr = datetime.now().strftime("%Y년 %m월 %d일")
 
+    # ⚡ FIX: 시스템 프롬프트 강화 — JSON만 출력하도록 명시
     system_prompt = (
         "너는 한국 독자를 위한 AI 산업 뉴스레터의 베테랑 에디터다. "
         "여러 소스(뉴스 매체, 커뮤니티 토론, 학술 논문, 오픈소스 도구)를 두루 살펴 "
         "사소한 가십을 빼고 영향력 있는 항목만 골라 한국어로 정제한다. "
-        "출력은 반드시 유효한 JSON만, 다른 설명 없이."
+        "응답은 반드시 '{' 로 시작해서 '}' 로 끝나는 순수 JSON만 출력하라. "
+        "마크다운 코드블록(```), 설명문, 인사말, 어떤 부가 텍스트도 일체 금지."
     )
 
     user_prompt = f"""다음은 지난 {LOOKBACK_HOURS}~48시간 동안 4개 소스에서 수집된 AI 관련 항목이다.
@@ -366,31 +371,32 @@ def curate_with_claude(articles: list[dict]) -> dict:
 # 항목 목록
 {blocks}
 
-이제 위 형식의 JSON만 출력."""
+이제 위 형식의 순수 JSON만 출력하라."""
 
     print(f"[INFO] Claude({CLAUDE_MODEL}) 큐레이션 중...")
+    # ⚡ FIX: prefill 제거 (claude-sonnet-4-6에서 미지원)
     msg = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=4096,
         system=system_prompt,
-        messages=[
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": "{"},
-        ],
+        messages=[{"role": "user", "content": user_prompt}],
     )
 
-    text = "{" + msg.content[0].text
+    text = msg.content[0].text
+    # 마크다운 코드블록 제거
     text = re.sub(r"```json\s*|\s*```", "", text)
+    # 첫 { 와 마지막 } 사이만 추출 (앞뒤 부가 텍스트가 있어도 안전)
+    first = text.find("{")
     last = text.rfind("}")
-    if last > 0:
-        text = text[: last + 1]
+    if first >= 0 and last > first:
+        text = text[first:last + 1]
 
     try:
         result = json.loads(text)
         print(f"[INFO] {len(result.get('stories', []))}개 선별됨")
         return result
     except json.JSONDecodeError as e:
-        print(f"[ERROR] JSON 파싱 실패: {e}\nRaw: {text[:500]}")
+        print(f"[ERROR] JSON 파싱 실패: {e}\nRaw response (first 800 chars):\n{text[:800]}")
         raise
 
 
