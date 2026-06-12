@@ -625,18 +625,21 @@ def render_newspaper_html(curation: dict, articles: list[dict]) -> str:
 def send_email(html: str, recipient: str):
     sender = os.environ["GMAIL_ADDRESS"]
     pwd = os.environ["GMAIL_APP_PASSWORD"]
+
+    recipients = [r.strip() for r in recipient.split(",") if r.strip()]
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🗞️ AI Daily — {datetime.now().strftime('%Y.%m.%d')}"
     msg["From"] = f"AI Daily <{sender}>"
-    msg["To"] = recipient
+    msg["To"] = ", ".join(recipients)
     msg["Date"] = formatdate(localtime=True)
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    print(f"[INFO] Gmail 발송 → {recipient}")
+    print(f"[INFO] Gmail 발송 → {recipients}")
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
         s.login(sender, pwd)
-        s.send_message(msg)
+        s.sendmail(sender, recipients, msg.as_string())
     print("[INFO] 발송 완료 ✅")
 
 
