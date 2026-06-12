@@ -1,6 +1,6 @@
 """
-AI Daily Newsletter — Multi-Source Edition
-- 데이터 소스: RSS (매체/블로그) + Hacker News API + arXiv API + GitHub Search API
+AI Daily Newsletter — Multi-Source Edition (with practical tips)
+- 데이터 소스: 매체 RSS + 실무자 블로그 RSS + Hacker News + arXiv + GitHub + Reddit
 - 흐름: 수집 → 이미지 추출 → Claude 큐레이션 → 신문 스타일 HTML → Gmail 발송
 """
 import json
@@ -22,6 +22,7 @@ import requests
 # ─────────────────────────────────────────────
 # 설정
 # ─────────────────────────────────────────────
+# 매체/빅테크 블로그 (source_type: news)
 RSS_FEEDS = {
     "TechCrunch AI": "https://techcrunch.com/category/artificial-intelligence/feed/",
     "The Verge AI": "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
@@ -36,24 +37,39 @@ RSS_FEEDS = {
     "Hugging Face Blog": "https://huggingface.co/blog/feed.xml",
 }
 
-# Hacker News 검색 쿼리 (AI 관련 키워드)
+# 실무자 블로그 (source_type: practical) — 실제 사용 팁/튜토리얼 위주
+PRACTICAL_RSS_FEEDS = {
+    "Simon Willison": "https://simonwillison.net/atom/everything/",
+    "One Useful Thing": "https://www.oneusefulthing.org/feed",
+    "Latent Space": "https://www.latent.space/feed",
+    "Dev.to AI": "https://dev.to/feed/tag/ai",
+    "Dev.to LLM": "https://dev.to/feed/tag/llm",
+}
+
+# Reddit 실무 서브레딧 (source_type: practical)
+PRACTICAL_SUBREDDITS = ["LocalLLaMA", "PromptEngineering", "ChatGPTCoding"]
+REDDIT_MIN_SCORE = 80
+
+# Hacker News 검색 쿼리 (source_type: community)
 HN_QUERY = '"AI" OR "LLM" OR "GPT" OR "Claude" OR "machine learning" OR "Anthropic" OR "OpenAI"'
 HN_MIN_POINTS = 50
 
-# arXiv AI 카테고리
+# arXiv AI 카테고리 (source_type: research)
 ARXIV_CATEGORIES = ["cs.AI", "cs.LG", "cs.CL", "cs.CV", "cs.NE"]
 
-# GitHub trending 근사 — AI 관련 토픽
+# GitHub trending 근사 — AI 관련 토픽 (source_type: tool)
 GITHUB_TOPICS = ["llm", "ai-agent", "agentic-ai", "generative-ai", "rag", "transformers"]
 
 LOOKBACK_HOURS = 24
-ARXIV_LOOKBACK_HOURS = 48        # 논문은 좀 더 넓게
-GITHUB_LOOKBACK_DAYS = 7         # 트렌딩은 일주일 단위
+PRACTICAL_LOOKBACK_HOURS = 48     # 실무 팁은 좀 더 넓게
+ARXIV_LOOKBACK_HOURS = 48
+GITHUB_LOOKBACK_DAYS = 7
 
 MAX_PER_SOURCE = 6
-MAX_HN_RESULTS = 12
+MAX_HN_RESULTS = 10
 MAX_ARXIV_RESULTS = 8
 MAX_GITHUB_RESULTS = 6
+MAX_REDDIT_PER_SUB = 8
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 USER_AGENT = "Mozilla/5.0 (compatible; AINewsletterBot/1.0)"
@@ -119,12 +135,12 @@ def fetch_og_image(url: str) -> str | None:
 
 
 # ─────────────────────────────────────────────
-# 1-A. RSS 수집 (매체/블로그)
+# 1-A. RSS 수집 (공통 함수)
 # ─────────────────────────────────────────────
-def fetch_rss_articles(hours: int = LOOKBACK_HOURS) -> list[dict]:
+def _fetch_rss_with_type(feeds: dict, source_type: str, hours: int) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     articles = []
-    for source, url in RSS_FEEDS.items():
+    for source, url in feeds.items():
         try:
             feed = feedparser.parse(url)
             count = 0
@@ -138,7 +154,7 @@ def fetch_rss_articles(hours: int = LOOKBACK_HOURS) -> list[dict]:
                     continue
                 articles.append({
                     "source": source,
-                    "source_type": "news",
+                    "source_type": source_type,
                     "title": (entry.get("title") or "").strip(),
                     "link": entry.get("link", ""),
                     "summary": clean_text(entry.get("summary") or entry.get("description") or ""),
@@ -149,6 +165,18 @@ def fetch_rss_articles(hours: int = LOOKBACK_HOURS) -> list[dict]:
         except Exception as e:
             print(f"[WARN] RSS {source} 실패: {e}")
     return articles
+
+
+def fetch_news_rss() -> list[dict]:
+    arts = _fetch_rss_with_type(RSS_FEEDS, "news", LOOKBACK_HOURS)
+    print(f"[INFO] News RSS: {len(arts)}개 수집")
+    return arts
+
+
+def fetch_practical_rss() -> list[dict]:
+    arts = _fetch_rss_with_type(PRACTICAL_RSS_FEEDS, "practical", PRACTICAL_LOOKBACK_HOURS)
+    print(f"[INFO] Practical RSS: {len(arts)}개 수집")
+    return arts
 
 
 # ─────────────────────────────────────────────
@@ -185,7 +213,7 @@ def fetch_hackernews_ai(hours: int = LOOKBACK_HOURS) -> list[dict]:
                     f"by {h.get('author', 'unknown')}. "
                     + clean_text(h.get("story_text") or "", 300)
                 ).strip(),
-                "image_url": None,  # HN은 og:image 폴백으로 보충됨
+                "image_url": None,
                 "published": h.get("created_at", datetime.now(timezone.utc).isoformat()),
             })
         print(f"[INFO] Hacker News: {len(articles)}개 수집")
@@ -196,7 +224,70 @@ def fetch_hackernews_ai(hours: int = LOOKBACK_HOURS) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# 1-C. arXiv (공식 Atom API → feedparser)
+# 1-C. Reddit (실무 팁)
+# ─────────────────────────────────────────────
+def fetch_reddit_practical(hours: int = PRACTICAL_LOOKBACK_HOURS) -> list[dict]:
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp()
+    articles = []
+    for sub in PRACTICAL_SUBREDDITS:
+        try:
+            resp = requests.get(
+                f"https://www.reddit.com/r/{sub}/top.json",
+                params={"t": "day", "limit": MAX_REDDIT_PER_SUB * 2},  # 필터링 여유
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            posts = resp.json().get("data", {}).get("children", [])
+            count = 0
+            for p in posts:
+                if count >= MAX_REDDIT_PER_SUB:
+                    break
+                d = p.get("data", {})
+                if d.get("created_utc", 0) < cutoff_ts:
+                    continue
+                if d.get("score", 0) < REDDIT_MIN_SCORE:
+                    continue
+                if d.get("over_18") or d.get("stickied"):
+                    continue
+                if not d.get("title"):
+                    continue
+
+                # 이미지 추출 (preview.images → thumbnail 폴백)
+                image_url = None
+                preview = d.get("preview", {})
+                if preview.get("images"):
+                    src = preview["images"][0].get("source", {}).get("url")
+                    if src:
+                        image_url = src.replace("&amp;", "&")
+                if not image_url:
+                    thumb = d.get("thumbnail", "")
+                    if thumb.startswith("http"):
+                        image_url = thumb
+
+                articles.append({
+                    "source": f"r/{sub}",
+                    "source_type": "practical",
+                    "title": d.get("title", ""),
+                    "link": "https://reddit.com" + d.get("permalink", ""),
+                    "summary": (
+                        f"⬆ {d.get('score', 0)} · 💬 {d.get('num_comments', 0)}. "
+                        + clean_text(d.get("selftext") or "", 400)
+                    ).strip(),
+                    "image_url": image_url,
+                    "published": datetime.fromtimestamp(
+                        d.get("created_utc", 0), tz=timezone.utc
+                    ).isoformat(),
+                })
+                count += 1
+        except Exception as e:
+            print(f"[WARN] Reddit r/{sub} 실패: {e}")
+    print(f"[INFO] Reddit: {len(articles)}개 수집")
+    return articles
+
+
+# ─────────────────────────────────────────────
+# 1-D. arXiv (공식 Atom API)
 # ─────────────────────────────────────────────
 def fetch_arxiv_ai() -> list[dict]:
     cat_query = "+OR+".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
@@ -225,7 +316,7 @@ def fetch_arxiv_ai() -> list[dict]:
                 "summary": (
                     f"저자: {authors}. 초록: " + clean_text(entry.get("summary") or "", 500)
                 ),
-                "image_url": None,  # arXiv는 이미지 없음, 플레이스홀더로 처리
+                "image_url": None,
                 "published": pub_dt.isoformat(),
             })
         print(f"[INFO] arXiv: {len(articles)}개 수집")
@@ -236,7 +327,7 @@ def fetch_arxiv_ai() -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# 1-D. GitHub Trending 근사 (Search API)
+# 1-E. GitHub Trending 근사 (Search API)
 # ─────────────────────────────────────────────
 def fetch_github_trending_ai() -> list[dict]:
     since = (datetime.now() - timedelta(days=GITHUB_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
@@ -267,10 +358,9 @@ def fetch_github_trending_ai() -> list[dict]:
                 "summary": clean_text(it.get("description") or "", 400) +
                            f" / 언어: {it.get('language') or 'N/A'} · 라이선스: "
                            f"{(it.get('license') or {}).get('name', 'N/A')}",
-                # GitHub의 자동 og:image는 깔끔한 소셜카드, fallback으로 owner avatar
                 "image_url": (it.get("owner") or {}).get("avatar_url"),
                 "published": it.get("pushed_at", datetime.now(timezone.utc).isoformat()),
-                "_repo_url": it.get("html_url", ""),  # og:image 보충용
+                "_repo_url": it.get("html_url", ""),
             })
         print(f"[INFO] GitHub: {len(articles)}개 수집")
         return articles
@@ -280,17 +370,18 @@ def fetch_github_trending_ai() -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# 1-E. 통합 수집기
+# 1-F. 통합 수집기
 # ─────────────────────────────────────────────
 def fetch_all_articles() -> list[dict]:
     print("[INFO] 수집 시작...")
     all_articles = []
-    all_articles.extend(fetch_rss_articles())
+    all_articles.extend(fetch_news_rss())
+    all_articles.extend(fetch_practical_rss())
     all_articles.extend(fetch_hackernews_ai())
+    all_articles.extend(fetch_reddit_practical())
     all_articles.extend(fetch_arxiv_ai())
     all_articles.extend(fetch_github_trending_ai())
 
-    # 통계
     by_type = {}
     img_count = 0
     for a in all_articles:
@@ -314,35 +405,36 @@ def curate_with_claude(articles: list[dict]) -> dict:
         f"ID: {i}\n타입: {a['source_type']}\n출처: {a['source']}\n제목: {a['title']}\n"
         f"이미지: {'있음' if a['image_url'] else '없음'}\n"
         f"요약: {a['summary'][:400]}"
-        for i, a in enumerate(articles[:80])
+        for i, a in enumerate(articles[:100])
     )
 
     today_kr = datetime.now().strftime("%Y년 %m월 %d일")
 
-    # ⚡ FIX: 시스템 프롬프트 강화 — JSON만 출력하도록 명시
     system_prompt = (
         "너는 한국 독자를 위한 AI 산업 뉴스레터의 베테랑 에디터다. "
-        "여러 소스(뉴스 매체, 커뮤니티 토론, 학술 논문, 오픈소스 도구)를 두루 살펴 "
-        "사소한 가십을 빼고 영향력 있는 항목만 골라 한국어로 정제한다. "
+        "여러 소스(뉴스 매체, 실무자 블로그, 커뮤니티 토론, 학술 논문, 오픈소스 도구)를 두루 살펴 "
+        "사소한 가십을 빼고 영향력 있는 항목 + 실무에 바로 도움 되는 팁을 골라 한국어로 정제한다. "
         "응답은 반드시 '{' 로 시작해서 '}' 로 끝나는 순수 JSON만 출력하라. "
         "마크다운 코드블록(```), 설명문, 인사말, 어떤 부가 텍스트도 일체 금지."
     )
 
-    user_prompt = f"""다음은 지난 {LOOKBACK_HOURS}~48시간 동안 4개 소스에서 수집된 AI 관련 항목이다.
+    user_prompt = f"""다음은 지난 24~48시간 동안 6개 소스에서 수집된 AI 관련 항목이다.
 
 # 소스 타입별 의미
-- news: 매체/빅테크 블로그 기사
+- news: 매체/빅테크 블로그 기사 (산업 동향, 제품 출시)
+- practical: 실무자 블로그 + Reddit 커뮤니티 (실제 사용 후기, 팁, 워크플로우, 프롬프트 기법)
 - community: Hacker News 핫토픽 (개발자 커뮤니티 반응)
 - research: arXiv 논문 (학술 연구, 영문 초록)
 - tool: GitHub 트렌딩 레포 (오픈소스 도구/프로젝트)
 
 # 카테고리 (필요한 것만 사용)
 - 🚀 신규 모델 / 제품 출시
-- 🔬 연구 & 논문                  ← research 타입은 주로 여기
+- 💡 실무 팁 / 활용법                ← practical 타입은 주로 여기 (핵심!)
+- 🔬 연구 & 논문                     ← research 타입은 주로 여기
 - 💼 산업 & 비즈니스 동향
 - 📜 정책 / 규제 / 윤리
-- 🛠️ 개발자 도구 / 오픈소스         ← tool 타입은 주로 여기
-- 🔥 커뮤니티 화제                  ← community 타입은 주로 여기
+- 🛠️ 개발자 도구 / 오픈소스           ← tool 타입은 주로 여기
+- 🔥 커뮤니티 화제                   ← community 타입은 주로 여기
 
 # JSON 출력 형식
 {{
@@ -350,9 +442,9 @@ def curate_with_claude(articles: list[dict]) -> dict:
   "stories": [
     {{
       "id": 0,
-      "category": "🚀 신규 모델 / 제품 출시",
+      "category": "💡 실무 팁 / 활용법",
       "headline_ko": "한국어 헤드라인 (15~30자, 임팩트 있게, 따옴표 X)",
-      "summary_ko": "2~3 문장 한국어 요약. 핵심 사실 + 의미.",
+      "summary_ko": "2~3 문장 한국어 요약. 핵심 사실 + 의미. 실무 팁이면 '어떻게 쓰는지'를 구체적으로.",
       "is_featured": false
     }}
   ],
@@ -360,10 +452,11 @@ def curate_with_claude(articles: list[dict]) -> dict:
 }}
 
 # 규칙
-- 총 8~12개 항목 선별. 가능한 다양한 소스 타입을 섞어. (예: 뉴스 4 + 커뮤니티 2 + 연구 2 + 도구 2)
+- 총 10~14개 항목 선별. 다양한 소스 타입을 섞어. 권장 비율: 뉴스 3-4 + 실무팁 3-4 + 커뮤니티 1-2 + 연구 1-2 + 도구 1-2.
+- **'💡 실무 팁 / 활용법'은 반드시 2개 이상 포함**. practical 타입을 우선 골라.
 - 정확히 1개의 story만 is_featured=true (오늘 가장 영향력 큰 것). featured는 반드시 image="있음" 기사.
-- research(arXiv 논문)는 "🔬 연구 & 논문"으로, tool(GitHub)은 "🛠️ 개발자 도구 / 오픈소스"로 우선 분류.
-- community(HN)는 토픽에 따라 적절히 분류.
+- 실무 팁 요약은 "어떻게 쓰는지" 구체적으로. (예: "GPT에게 X를 시킬 때 Y 프롬프트를 쓰면 결과가 30% 좋아진다")
+- research(arXiv)는 "🔬 연구 & 논문"으로, tool(GitHub)은 "🛠️ 개발자 도구 / 오픈소스"로 우선 분류.
 - 중복/유사 주제는 1개로 통합.
 - 헤드라인은 정보전달형, 클릭베이트 X.
 - 오늘 날짜: {today_kr}
@@ -374,18 +467,15 @@ def curate_with_claude(articles: list[dict]) -> dict:
 이제 위 형식의 순수 JSON만 출력하라."""
 
     print(f"[INFO] Claude({CLAUDE_MODEL}) 큐레이션 중...")
-    # ⚡ FIX: prefill 제거 (claude-sonnet-4-6에서 미지원)
     msg = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=5000,  # 항목 늘었으니 살짝 늘림
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
 
     text = msg.content[0].text
-    # 마크다운 코드블록 제거
     text = re.sub(r"```json\s*|\s*```", "", text)
-    # 첫 { 와 마지막 } 사이만 추출 (앞뒤 부가 텍스트가 있어도 안전)
     first = text.find("{")
     last = text.rfind("}")
     if first >= 0 and last > first:
@@ -412,7 +502,6 @@ def enrich_missing_images(articles: list[dict], story_ids: list[int]):
 
     def work(item):
         i, a = item
-        # GitHub repo는 _repo_url 사용 (이미 image_url 있는 경우 여기 안 옴)
         url = a.get("_repo_url") or a["link"]
         return i, fetch_og_image(url)
 
@@ -442,6 +531,7 @@ def source_badge(article):
     """소스 타입별 배지"""
     badges = {
         "news": "",
+        "practical": "💡 TIP ",
         "community": "🔥 HN ",
         "research": "📄 PAPER ",
         "tool": "💻 REPO ",
@@ -537,12 +627,25 @@ def render_newspaper_html(curation: dict, articles: list[dict]) -> str:
         )
         others = [p for p in valid if p != featured]
 
-        by_cat = OrderedDict()
+        # 카테고리 표시 순서 (실무 팁을 위로!)
+        category_order = [
+            "🚀 신규 모델 / 제품 출시",
+            "💡 실무 팁 / 활용법",
+            "🔥 커뮤니티 화제",
+            "🛠️ 개발자 도구 / 오픈소스",
+            "🔬 연구 & 논문",
+            "💼 산업 & 비즈니스 동향",
+            "📜 정책 / 규제 / 윤리",
+        ]
+
+        by_cat = OrderedDict((c, []) for c in category_order)
         for s, a in others:
             by_cat.setdefault(s["category"], []).append((s, a))
 
         body_parts = [render_featured(*featured)]
         for cat, items in by_cat.items():
+            if not items:
+                continue
             body_parts.append(render_section_header(cat))
             body_parts.append(render_two_column(items))
         body = "\n".join(body_parts)
@@ -565,7 +668,8 @@ def render_newspaper_html(curation: dict, articles: list[dict]) -> str:
 """
 
     sources_line = (
-        ", ".join(RSS_FEEDS.keys())
+        ", ".join(list(RSS_FEEDS.keys()) + list(PRACTICAL_RSS_FEEDS.keys())
+                  + [f"r/{s}" for s in PRACTICAL_SUBREDDITS])
         + ", Hacker News API, arXiv API, GitHub Search API"
     )
 
